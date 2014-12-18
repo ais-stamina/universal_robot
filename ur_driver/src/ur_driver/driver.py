@@ -21,6 +21,7 @@ from ur_driver.deserializeRT import RobotStateRT
 
 from ur_msgs.srv import SetPayload, SetIO
 from ur_msgs.msg import *
+from std_msgs.msg import Bool
 
 # renaming classes
 DigitalIn = Digital
@@ -68,7 +69,7 @@ MAX_VELOCITY = 10.0
 
 #Bounds for SetPayload service
 MIN_PAYLOAD = 0.0
-MAX_PAYLOAD = 1.0
+MAX_PAYLOAD = 9.0
 #Using a very conservative value as it should be set throught the parameter server
 
 
@@ -95,8 +96,17 @@ last_joint_states_lock = threading.Lock()
 pub_joint_states = rospy.Publisher('joint_states', JointState, queue_size=1)
 pub_wrench = rospy.Publisher('wrench', WrenchStamped, queue_size=1)
 pub_io_states = rospy.Publisher('io_states', IOStates, queue_size=1)
-#dump_state = open('dump_state', 'wb')
+pub_emergency_stop = rospy.Publisher("emergency_stop", Bool, queue_size=1)
 
+allow_execution = None
+#dump_state = open('dump_state', 'wb')
+def callback(data):
+    global allow_execution
+   
+    allow_execution = not(data.data)
+    if not allow_execution:
+        rospy.loginfo("Programming is currently prevented")
+sub_abort_execution = rospy.Subscriber("abort_execution", Bool, callback)
 class EOF(Exception): pass
 
 def dumpstacks():
@@ -658,8 +668,9 @@ class URServiceProvider(object):
 class URTrajectoryFollower(object):
     RATE = 0.02
     def __init__(self, robot, goal_time_tolerance=None):
-        self.goal_time_tolerance = goal_time_tolerance or rospy.Duration(0.0)
-        self.joint_goal_tolerances = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+        self.goal_time_tolerance = goal_time_tolerance or rospy.Duration(2.0)
+        self.joint_goal_tolerances = [0.07, 0.07, 0.07, 0.07, 0.07, 0.07]
+        self.vel_goal_tolerances = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
         self.following_lock = threading.Lock()
         self.T0 = time.time()
         self.robot = robot
@@ -703,6 +714,7 @@ class URTrajectoryFollower(object):
             positions = state.position,
             velocities = [0] * 6,
             accelerations = [0] * 6,
+            effort = [0]*6,
             time_from_start = rospy.Duration(0.0))]
 
     def start(self):
@@ -778,6 +790,7 @@ class URTrajectoryFollower(object):
                 point1 = sample_traj(self.traj, now - self.traj_t0 + STOP_DURATION)
                 point1.velocities = [0] * 6
                 point1.accelerations = [0] * 6
+                point1.effort = [0] * 6
                 point1.time_from_start = rospy.Duration(STOP_DURATION)
                 self.traj_t0 = now
                 self.traj = JointTrajectory()
@@ -791,57 +804,74 @@ class URTrajectoryFollower(object):
 
     last_now = time.time()
     def _update(self, event):
+        global allow_execution
         if self.robot and self.traj:
-            now = time.time()
-            if (now - self.traj_t0) <= self.traj.points[-1].time_from_start.to_sec():
-                self.last_point_sent = False #sending intermediate points
-                setpoint = sample_traj(self.traj, now - self.traj_t0)
-                try:
-                    self.robot.send_servoj(999, setpoint.positions, 4 * self.RATE)
-                except socket.error:
-                    pass
+            if allow_execution:
+                now = time.time()
+                if (now - self.traj_t0) <= self.traj.points[-1].time_from_start.to_sec():
+                    self.last_point_sent = False #sending intermediate points
+                    setpoint = sample_traj(self.traj, now - self.traj_t0)
+                    try:
+                        self.robot.send_servoj(999, setpoint.positions, 4 * self.RATE)
+                    except socket.error:
+                        pass
                     
-            elif not self.last_point_sent:
-                # All intermediate points sent, sending last point to make sure we
-                # reach the goal.
-                # This should solve an issue where the robot does not reach the final
-                # position and errors out due to not reaching the goal point.
-                last_point = self.traj.points[-1]
-                state = self.robot.get_joint_states()
-                position_in_tol = within_tolerance(state.position, last_point.positions, self.joint_goal_tolerances)
-                # Performing this check to try and catch our error condition.  We will always
-                # send the last point just in case.
-                if not position_in_tol:
-                    rospy.logwarn("Trajectory time exceeded and current robot state not at goal, last point required")
-                    rospy.logwarn("Current trajectory time: %s, last point time: %s" % \
-                                (now - self.traj_t0, self.traj.points[-1].time_from_start.to_sec()))
-                    rospy.logwarn("Desired: %s\nactual: %s\nvelocity: %s" % \
-                                          (last_point.positions, state.position, state.velocity))
-                setpoint = sample_traj(self.traj, self.traj.points[-1].time_from_start.to_sec())
-
-                try:
-                    self.robot.send_servoj(999, setpoint.positions, 4 * self.RATE)
-                    self.last_point_sent = True
-                except socket.error:
-                    pass
-                    
-            else:  # Off the end
-                if self.goal_handle:
+                elif not self.last_point_sent:
+                    # All intermediate points sent, sending last point to make sure we
+                    # reach the goal.
+                    # This should solve an issue where the robot does not reach the final
+                    # position and errors out due to not reaching the goal point.
                     last_point = self.traj.points[-1]
                     state = self.robot.get_joint_states()
-                    position_in_tol = within_tolerance(state.position, last_point.positions, [0.1]*6)
-                    velocity_in_tol = within_tolerance(state.velocity, last_point.velocities, [0.05]*6)
-                    if position_in_tol and velocity_in_tol:
-                        # The arm reached the goal (and isn't moving).  Succeeding
-                        self.goal_handle.set_succeeded()
-                        self.goal_handle = None
-                    #elif now - (self.traj_t0 + last_point.time_from_start.to_sec()) > self.goal_time_tolerance.to_sec():
-                    #    # Took too long to reach the goal.  Aborting
-                    #    rospy.logwarn("Took too long to reach the goal.\nDesired: %s\nactual: %s\nvelocity: %s" % \
-                    #                      (last_point.positions, state.position, state.velocity))
-                    #    self.goal_handle.set_aborted(text="Took too long to reach the goal")
-                    #    self.goal_handle = None
+                    position_in_tol = within_tolerance(state.position, last_point.positions, self.joint_goal_tolerances)
+                    # Performing this check to try and catch our error condition.  We will always
+                    # send the last point just in case.
+                    if not position_in_tol:
+                        rospy.logwarn("Trajectory time exceeded and current robot state not at goal, last point required")
+                        rospy.logwarn("Current trajectory time: %s, last point time: %s" % \
+                                    (now - self.traj_t0, self.traj.points[-1].time_from_start.to_sec()))
+                        rospy.logwarn("Desired: %s\nactual: %s\nvelocity: %s" % \
+                                          (last_point.positions, state.position, state.velocity))
+                    setpoint = sample_traj(self.traj, self.traj.points[-1].time_from_start.to_sec())
 
+                    try:
+                        self.robot.send_servoj(999, setpoint.positions, 4 * self.RATE)
+                        self.last_point_sent = True
+                    except socket.error:
+                        pass
+                    
+                else:  # Off the end
+                    if self.goal_handle:
+                        last_point = self.traj.points[-1]
+                        state = self.robot.get_joint_states()
+                        position_in_tol = within_tolerance(state.position, last_point.positions, [0.1]*6)
+                        #velocity_in_tol = within_tolerance(state.velocity, last_point.velocities, [0.05]*6)
+                        if position_in_tol:# and velocity_in_tol:
+                            # The arm reached the goal (and isn't moving).  Succeeding
+                            rospy.loginfo("Trajectory was successfully executed!")
+                            self.goal_handle.set_succeeded()
+                            self.goal_handle = None
+                        #elif now - (self.traj_t0 + last_point.time_from_start.to_sec()) > self.goal_time_tolerance.to_sec():
+                        #    # Took too long to reach the goal.  Aborting
+                        #    rospy.logwarn("Took too long to reach the goal.\nDesired: %s\nactual: %s\nvelocity: %s" % \
+                        #                      (last_point.positions, state.position, state.velocity))
+                        #    self.goal_handle.set_aborted(text="Took too long to reach the goal")
+                        #    self.goal_handle = None
+                        elif now - (self.traj_t0 + last_point.time_from_start.to_sec()) > self.goal_time_tolerance.to_sec():
+                            # Took too long to reach the goal. Aborting
+                            rospy.logwarn("Took too long to reach the goal.\nDesired: %s\nactual: %s\nvelocity: %s" % \
+                            (last_point.positions, state.position, state.velocity))
+                            str = "Time tolerance %s"%self.goal_time_tolerance
+                            rospy.logwarn(str)
+                            self.goal_handle.set_aborted(text="Took too long to reach the goal")
+                            self.goal_handle = None
+                        else:
+                            self.goal_handle.set_aborted()
+                            self.goal_handle = None
+            else:
+                if self.goal_handle:
+                    self.goal_handle.set_aborted(text="Execution was cancel by the user!")
+                    self.goal_handle = None                            
 
 # joint_names: list of joints
 #
@@ -899,12 +929,13 @@ def main():
     if rospy.get_param("use_sim_time", False):
         rospy.logwarn("use_sim_time is set!!!")
     global prevent_programming
-    prevent_programming = rospy.get_param("prevent_programming", False)
+    prevent_programming = rospy.get_param("~prevent_programming", False)
     prefix = rospy.get_param("~prefix", "")
     print "Setting prefix to %s" % prefix
     global joint_names
     joint_names = [prefix + name for name in JOINT_NAMES]
-
+    global allow_execution
+    allow_execution =True
     # Parses command line arguments
     parser = optparse.OptionParser(usage="usage: %prog robot_hostname [reverse_port]")
     (options, args) = parser.parse_args(rospy.myargv()[1:])
@@ -968,7 +999,7 @@ def main():
             # Checks for disconnect
             if getConnectedRobot(wait=False):
                 time.sleep(0.2)
-                prevent_programming = rospy.get_param("prevent_programming", False)
+                prevent_programming = rospy.get_param("~prevent_programming", False)
                 if prevent_programming:
                     print "Programming now prevented"
                     connection.send_reset_program()
@@ -983,7 +1014,7 @@ def main():
                     while not connection.ready_to_program():
                         print "Waiting to program"
                         time.sleep(1.0)
-                    prevent_programming = rospy.get_param("prevent_programming", False)
+                    prevent_programming = rospy.get_param("~prevent_programming", False)
                     connection.send_program()
 
                     r = getConnectedRobot(wait=True, timeout=1.0)

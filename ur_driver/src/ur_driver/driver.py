@@ -929,6 +929,8 @@ def main():
     if rospy.get_param("use_sim_time", False):
         rospy.logwarn("use_sim_time is set!!!")
     global prevent_programming
+    if not rospy.has_param("~prevent_programming"):
+        rospy.set_param("~prevent_programming", False)
     prevent_programming = rospy.get_param("~prevent_programming", False)
     prefix = rospy.get_param("~prefix", "")
     print "Setting prefix to %s" % prefix
